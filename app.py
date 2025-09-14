@@ -19,7 +19,7 @@ from utils.logic import (
     leadership_list, skill_grouping, select_best_team, what_if_simulation
 )
 
-import os, sys
+import os, sys, re
 from urllib.parse import urlparse, urljoin
 
 # ---------------------------
@@ -61,16 +61,51 @@ with engine.begin() as conn:
         );
     """)
 
-# seed default admin if missing
+# ---------------------------
+# Password policy
+# ---------------------------
+def is_strong_password(p: str, username: str = "") -> bool:
+    """
+    Require 12+ chars and at least 3 of 4 classes: lower, upper, digit, symbol.
+    Also reject trivial values and those containing the username.
+    """
+    if not p or len(p) < 12:
+        return False
+    classes = sum(bool(re.search(rx, p)) for rx in [r"[a-z]", r"[A-Z]", r"\d", r"[^\w\s]"])
+    if classes < 3:
+        return False
+    weak = {"123", "1234", "12345", "123456", "password", "admin", "qwerty"}
+    if p.lower() in weak:
+        return False
+    if username and username.lower() in p.lower():
+        return False
+    return True
+
+# ---------------------------
+# Optional: seed first admin ONLY via environment (no hardcoded defaults)
+# ---------------------------
+ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME")
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD")
+
 with engine.begin() as conn:
-    res = conn.execute(text("SELECT COUNT(*) FROM users WHERE username='admin'"))
-    if res.scalar() == 0:
-        pwd_hash = bcrypt.generate_password_hash("123").decode()
+    user_count = conn.execute(text("SELECT COUNT(*) FROM users")).scalar() or 0
+
+if user_count == 0 and ADMIN_USERNAME and ADMIN_PASSWORD:
+    if not is_strong_password(ADMIN_PASSWORD, ADMIN_USERNAME):
+        raise RuntimeError(
+            "ADMIN_PASSWORD does not meet strength requirements "
+            "(12+ chars, mix of cases/digits/symbols, not containing username)."
+        )
+    with engine.begin() as conn:
+        pwd_hash = bcrypt.generate_password_hash(ADMIN_PASSWORD).decode()
         conn.execute(
             text("INSERT INTO users (username, password_hash) VALUES (:u, :p)"),
-            {"u": "admin", "p": pwd_hash}
+            {"u": ADMIN_USERNAME, "p": pwd_hash}
         )
 
+# ---------------------------
+# User model
+# ---------------------------
 class User(UserMixin):
     def __init__(self, id, username, password_hash):
         self.id = id
@@ -191,6 +226,11 @@ def login():
                 {"u": username}
             ).fetchone()
         
+        # Hard block the notorious default combo if it ever slipped in
+        if row and row.username == "admin" and bcrypt.check_password_hash(row.password_hash, "123"):
+            flash('The default admin/123 is disabled. Contact an owner to reset admin.', 'error')
+            return render_template('login.html')
+
         if row and bcrypt.check_password_hash(row.password_hash, password):
             user = User(*row)
             login_user(user, remember=True)
@@ -227,11 +267,16 @@ def dashboard():
 @login_required
 def add_admin():
     if request.method == 'POST':
-        username = request.form.get('username')
-        password = request.form.get('password')
+        username = (request.form.get('username') or '').strip()
+        password = request.form.get('password') or ''
         if not username or not password:
             flash('Username and password required', 'error')
             return redirect(url_for('add_admin'))
+
+        if not is_strong_password(password, username):
+            flash('Password too weak. Use 12+ chars and mix upper/lower, digits, symbols.', 'error')
+            return redirect(url_for('add_admin'))
+
         try:
             with engine.begin() as conn:
                 pwd_hash = bcrypt.generate_password_hash(password).decode()
@@ -361,4 +406,6 @@ def add_personnel():
 # Main
 # ---------------------------
 if __name__ == '__main__':
-    app.run(debug=True)
+    # Bind to 0.0.0.0 and use Render's assigned port if present
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=False)
